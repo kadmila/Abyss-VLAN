@@ -1103,8 +1103,7 @@ void arg_dstr_set(arg_dstr_t ds, char* str, arg_dstr_freefn* free_proc) {
         } else {
             ds->data = ds->sbuf;
             ds->free_proc = ARG_DSTR_STATIC;
-            strncpy(ds->data, str, sizeof(ds->sbuf) - 1); /* NOSONAR */
-            ds->data[sizeof(ds->sbuf) - 1] = '\0';
+            strncpy(ds->data, str, sizeof(ds->sbuf)); /* NOSONAR */
             assert(ds->data[ARG_DSTR_SIZE] == '\0');
         }
     } else {
@@ -4907,7 +4906,7 @@ void arg_cmd_uninit(void) {
     arg_hashtable_destroy(s_hashtable, 1);
 }
 
-void arg_cmd_register(const char* name, arg_cmdfn proc, const char* description, void* ctx) {
+void arg_cmd_register(const char* name, arg_cmdfn* proc, const char* description, void* ctx) {
     arg_cmd_info_t* cmd_info;
     size_t slen_name;
     void* k;

@@ -1,3 +1,5 @@
+#include "../../include/platform.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +9,9 @@
 #include <ws2tcpip.h>
 #include <Windows.h>
 #include <netioapi.h>
+#include <combaseapi.h>
+
+#include "../../include/defaults.h"
 
 #include "../../third_party/wintun/include/wintun.h"
 
@@ -25,34 +30,11 @@ static WINTUN_RELEASE_RECEIVE_PACKET_FUNC *WintunReleaseReceivePacket;
 static WINTUN_ALLOCATE_SEND_PACKET_FUNC *WintunAllocateSendPacket;
 static WINTUN_SEND_PACKET_FUNC *WintunSendPacket;
 
-// InitializeWintun loads the Wintun library and retrieves function entries.
-static HMODULE
-InitializeWintun(void)
-{
-    HMODULE Wintun =
-        LoadLibraryExW(L"./wintun.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!Wintun)
-        return NULL;
-#define X(Name) ((*(FARPROC *)&Name = GetProcAddress(Wintun, #Name)) == NULL)
-    if (X(WintunCreateAdapter) || X(WintunCloseAdapter) || X(WintunOpenAdapter) || X(WintunGetAdapterLUID) ||
-        X(WintunGetRunningDriverVersion) || X(WintunDeleteDriver) || X(WintunSetLogger) || X(WintunStartSession) ||
-        X(WintunEndSession) || X(WintunGetReadWaitEvent) || X(WintunReceivePacket) || X(WintunReleaseReceivePacket) ||
-        X(WintunAllocateSendPacket) || X(WintunSendPacket))
-#undef X
-    {
-        DWORD LastError = GetLastError();
-        FreeLibrary(Wintun);
-        SetLastError(LastError);
-        return NULL;
-    }
-    return Wintun;
-}
+static HMODULE wintun_module;
+static int is_stderr_redirected = 1;
 
-static int IsStderrRedirected = 1;
-
-// ConsoleLogger is wintun-compatible logger function.
 static void CALLBACK
-ConsoleLogger(_In_ WINTUN_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ const WCHAR *LogLine)
+WintunLogger(_In_ WINTUN_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ const WCHAR *LogLine)
 {
     SYSTEMTIME SystemTime;
     FileTimeToSystemTime((FILETIME *)&Timestamp, &SystemTime);
@@ -75,7 +57,8 @@ ConsoleLogger(_In_ WINTUN_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ con
     default:
         return;
     }
-    if (IsStderrRedirected)
+    if (is_stderr_redirected)
+    {
         fwprintf(
             stderr,
             L"%04u-%02u-%02u %02u:%02u:%02u.%04u [%ls] %ls\n",
@@ -88,7 +71,9 @@ ConsoleLogger(_In_ WINTUN_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ con
             SystemTime.wMilliseconds,
             LevelMarker,
             LogLine);
+    }
     else
+    {
         fwprintf(
             stderr,
             L"%04u-%02u-%02u %02u:%02u:%02u.%04u %ls[%ls]\033[0m %ls\n",
@@ -102,6 +87,7 @@ ConsoleLogger(_In_ WINTUN_LOGGER_LEVEL Level, _In_ DWORD64 Timestamp, _In_z_ con
             ColorCode,
             LevelMarker,
             LogLine);
+    }
 }
 
 static DWORD64 Now(VOID)
@@ -115,7 +101,6 @@ static DWORD64 Now(VOID)
     return t.QuadPart;
 }
 
-///// logger helper functions
 static DWORD
 LogError(_In_z_ const WCHAR *Prefix, _In_ DWORD Error)
 {
@@ -138,7 +123,9 @@ LogError(_In_z_ const WCHAR *Prefix, _In_ DWORD Error)
         0,
         (va_list *)(DWORD_PTR[]){ (DWORD_PTR)Prefix, (DWORD_PTR)Error, (DWORD_PTR)SystemMessage });
     if (FormattedMessage)
-        ConsoleLogger(WINTUN_LOG_ERR, Now(), FormattedMessage);
+    {
+        WintunLogger(WINTUN_LOG_ERR, Now(), FormattedMessage);
+    }
     LocalFree(FormattedMessage);
     LocalFree(SystemMessage);
     return Error;
@@ -161,157 +148,199 @@ Log(_In_ WINTUN_LOGGER_LEVEL Level, _In_z_ const WCHAR *Format, ...)
     va_start(args, Format);
     _vsnwprintf_s(LogLine, _countof(LogLine), _TRUNCATE, Format, args);
     va_end(args);
-    ConsoleLogger(Level, Now(), LogLine);
+    WintunLogger(Level, Now(), LogLine);
 }
 
-static void
-InitializeLogger(void)
+///// Interface implementation
+
+int
+avlan_init(void)
 {
-    IsStderrRedirected = _isatty(_fileno(stderr)) == 0;
-    WintunSetLogger(ConsoleLogger);
-    Log(WINTUN_LOG_INFO, L"Wintun logger initialized");
-}
-
-// Network standard compliances
-static USHORT
-IPChecksum(_In_reads_bytes_(Len) BYTE *Buffer, _In_ DWORD Len)
-{
-    ULONG Sum = 0;
-    for (; Len > 1; Len -= 2, Buffer += 2)
-        Sum += *(USHORT *)Buffer;
-    if (Len)
-        Sum += *Buffer;
-    Sum = (Sum >> 16) + (Sum & 0xffff);
-    Sum += (Sum >> 16);
-    return (USHORT)(~Sum);
-}
-
-///// Main logic
-
-// process-wide lifespan control
-static HANDLE QuitEvent;
-static volatile BOOL HaveQuit;
-
-static void
-PrintPacket(_In_ const BYTE *Packet, _In_ DWORD PacketSize)
-{
-    // print Packet in hex with 16 bytes per line
-    Log(WINTUN_LOG_INFO, L"received packet(%u bytes)", PacketSize);
-    for (DWORD i = 0; i < PacketSize; i += 16)  {
-        WCHAR Line[64] = { 0 };
-        DWORD LineSize = min(16, PacketSize - i);
-        for (DWORD j = 0; j < LineSize; ++j)
-            swprintf_s(Line + j * 3, _countof(Line) - j * 3, L"%02X ", Packet[i + j]);
-        wprintf(L"%ls\n", Line);
-    }
-}
-
-static DWORD WINAPI
-ReceivePackets(_Inout_ DWORD_PTR SessionPtr)
-{
-    WINTUN_SESSION_HANDLE Session = (WINTUN_SESSION_HANDLE)SessionPtr;
-    HANDLE WaitHandles[] = { WintunGetReadWaitEvent(Session), QuitEvent };
-
-    while (!HaveQuit)
+    wintun_module = LoadLibraryExW(L"./wintun.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!wintun_module)
     {
-        DWORD PacketSize;
-        BYTE *Packet = WintunReceivePacket(Session, &PacketSize); //This call is non-blocking; returns NULL if no packet is available
-        if (Packet)
-        {
-            if ((Packet[0] >> 4) == 4) {
-                // IPv4 packet
-                PrintPacket(Packet, PacketSize);
-            }
-            WintunReleaseReceivePacket(Session, Packet);
-        }
-        else
-        {
-            DWORD LastError = GetLastError();
-            switch (LastError)
-            {
-            case ERROR_NO_MORE_ITEMS:
-                // wait for a packet [WAIT_OBJECT_0] or program termination [WAIT_OBJECT_0 + 1]
-                if (WaitForMultipleObjects(_countof(WaitHandles), WaitHandles, FALSE, INFINITE) == WAIT_OBJECT_0)
-                    continue;
-                return ERROR_SUCCESS; // termination event signaled
-            default: // unexpected error in this thread
-                LogError(L"Packet read failed", LastError);
-                return LastError;
-            }
-        }
+        return 1;
     }
-    return ERROR_SUCCESS;
-}
 
-int run(void)
-{
-    HMODULE Wintun = InitializeWintun();
-    if (!Wintun)
-        return LogError(L"Failed to initialize Wintun", GetLastError());
+#define X(Name) ((*(FARPROC *)&Name = GetProcAddress(wintun_module, #Name)) == NULL)
+    if (X(WintunCreateAdapter) || X(WintunCloseAdapter) || X(WintunOpenAdapter) || X(WintunGetAdapterLUID) ||
+        X(WintunGetRunningDriverVersion) || X(WintunDeleteDriver) || X(WintunSetLogger) || X(WintunStartSession) ||
+        X(WintunEndSession) || X(WintunGetReadWaitEvent) || X(WintunReceivePacket) || X(WintunReleaseReceivePacket) ||
+        X(WintunAllocateSendPacket) || X(WintunSendPacket))
+#undef X
+    {
+        FreeLibrary(wintun_module);
+        wintun_module = NULL;
+        return 1;
+    }
     
-    InitializeLogger();
+    is_stderr_redirected = _isatty(_fileno(stderr)) == 0;
+    WintunSetLogger(WintunLogger);
 
-    DWORD LastError;
-    HaveQuit = FALSE;
-    QuitEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!QuitEvent)
+    return 0;
+}
+
+void 
+avlan_cleanup(void)
+{
+    if (wintun_module)
     {
-        LastError = LogError(L"Failed to create event", GetLastError());
-        goto cleanupWintun;
+        FreeLibrary(wintun_module);
+        wintun_module = NULL;
     }
+}
 
-    GUID ExampleGuid = { 0xdeadbabe, 0xcafe, 0xbeef, { 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef } };
-    WINTUN_ADAPTER_HANDLE Adapter = WintunCreateAdapter(L"Demo", L"Example", &ExampleGuid);
-    if (!Adapter)
+struct avlan_adapter {
+    WINTUN_ADAPTER_HANDLE wintun_adapter;
+    WINTUN_SESSION_HANDLE wintun_session;
+};
+
+struct avlan_adapter*
+avlan_create_adapter(const char *adapter_name, const char *cidr)
+{
+    wchar_t adapter_name_w[ADAPTER_NAME_MAX_LENGTH];
+    struct avlan_adapter *adapter;
+
+    if (MultiByteToWideChar(CP_UTF8, 0, adapter_name, -1, adapter_name_w, ADAPTER_NAME_MAX_LENGTH) == 0) 
     {
-        LastError = GetLastError();
-        LogError(L"Failed to create adapter", LastError);
-        goto cleanupQuitEvent;
+        return NULL;
     }
-
-    DWORD Version = WintunGetRunningDriverVersion();
-    Log(WINTUN_LOG_INFO, L"Wintun v%u.%u loaded", (Version >> 16) & 0xff, (Version >> 0) & 0xff);
-
-    MIB_UNICASTIPADDRESS_ROW AddressRow;
-    InitializeUnicastIpAddressEntry(&AddressRow);
-    WintunGetAdapterLUID(Adapter, &AddressRow.InterfaceLuid);
-    AddressRow.Address.Ipv4.sin_family = AF_INET;
-    AddressRow.Address.Ipv4.sin_addr.S_un.S_addr = htonl((10 << 24) | (6 << 16) | (1 << 8) | (1 << 0)); /* 10.6.1.1 */
-    AddressRow.OnLinkPrefixLength = 16; /* This is a /16 network */
-    AddressRow.DadState = IpDadStatePreferred; // state no ip address conflict with other adapters in this network
-    LastError = CreateUnicastIpAddressEntry(&AddressRow);
-    if (LastError != ERROR_SUCCESS && LastError != ERROR_OBJECT_ALREADY_EXISTS)
-    {
-        LogError(L"Failed to set IP address", LastError);
-        goto cleanupAdapter;
-    }
-
-    WINTUN_SESSION_HANDLE Session = WintunStartSession(Adapter, 0x400000);
-    if (!Session)
-    {
-        LastError = LogLastError(L"Failed to create adapter");
-        goto cleanupAdapter;
-    }
-
-    Log(WINTUN_LOG_INFO, L"Launching threads and mangling packets...");
-
-    HANDLE Worker = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)ReceivePackets, (LPVOID)Session, 0, NULL);
-    if (!Worker)
-    {
-        LastError = LogError(L"Failed to create threads", GetLastError());
-        goto cleanupSession;
-    }
-    WaitForSingleObject(Worker, INFINITE);
-
-cleanupSession:
-    CloseHandle(Worker);
     
-    WintunEndSession(Session);
-cleanupAdapter:
-    WintunCloseAdapter(Adapter);
-cleanupQuitEvent:
-    CloseHandle(QuitEvent);
-cleanupWintun:
-    FreeLibrary(Wintun);
-    return LastError;
+    adapter = malloc(sizeof(struct avlan_adapter));
+    if (!adapter)
+    {
+        return NULL;
+    }
+
+    GUID adapter_guid;
+    if (CoCreateGuid(&adapter_guid) != S_OK)
+    {
+        goto fail;
+    }
+
+    adapter->wintun_adapter = WintunCreateAdapter(adapter_name_w, L"AbyssVLAN", &adapter_guid);
+    if (!adapter->wintun_adapter)
+    {
+        goto fail;
+    }
+
+    MIB_UNICASTIPADDRESS_ROW address_row;
+
+    char ip[16]; // "255.255.255.255"
+    const char *slash = strchr(cidr, '/');
+    if (slash == NULL)
+    {
+        goto fail;
+    }
+
+    size_t len = (size_t)(slash - cidr);
+    if (len >= sizeof(ip))
+    {
+        goto fail;
+    }
+
+    memcpy(ip, cidr, len);
+    ip[len] = '\0';
+
+    int prefix = atoi(slash + 1);
+    if (prefix < 0 || prefix > 32)
+    {
+        goto fail;
+    }
+
+    InitializeUnicastIpAddressEntry(&address_row);
+    WintunGetAdapterLUID(adapter->wintun_adapter, &address_row.InterfaceLuid);
+
+    address_row.Address.si_family = AF_INET;
+    if (InetPtonA(AF_INET, ip, &address_row.Address.Ipv4.sin_addr) != 1)
+    {
+        goto fail;
+    }
+
+    address_row.OnLinkPrefixLength = (UINT8)prefix;
+    address_row.DadState = IpDadStatePreferred; // state no ip address conflict with other adapters in this network
+    NTSTATUS status = CreateUnicastIpAddressEntry(&address_row);
+    if (status != ERROR_SUCCESS && status != ERROR_OBJECT_ALREADY_EXISTS)
+    {
+        SetLastError(status);
+        goto fail;
+    }
+
+    adapter->wintun_session = WintunStartSession(adapter->wintun_adapter, 0x400000);
+    if (!adapter->wintun_session)
+    {
+        goto fail;
+    }
+
+    return adapter;
+
+fail:
+    free(adapter);
+    return NULL;
+}
+
+int 
+avlan_adapter_poll(struct avlan_adapter *adapter, uint8_t *buffer, uint32_t buffer_size, uint32_t *bytes_received)
+{
+    *bytes_received = 0;
+
+    DWORD packet_size;
+    BYTE *packet = WintunReceivePacket(adapter->wintun_session, &packet_size); //non-blocking
+    if (!packet) {
+        DWORD last_error = GetLastError();
+        if (last_error == ERROR_NO_MORE_ITEMS) {
+            return 0;
+        } else {
+            SetLastError(last_error);
+            return 1;
+        }
+    }
+
+    if (packet_size > buffer_size)
+    {
+        goto fail;
+    }
+    
+    memcpy(buffer, packet, packet_size);
+    *bytes_received = packet_size;
+
+    WintunReleaseReceivePacket(adapter->wintun_session, packet);
+    return 0;
+
+fail:
+    WintunReleaseReceivePacket(adapter->wintun_session, packet);
+    return 1;
+}
+
+int 
+avlan_adapter_wait(struct avlan_adapter *adapter, uint32_t timeout_ms)
+{
+    return WaitForSingleObject(WintunGetReadWaitEvent(adapter->wintun_session), timeout_ms) == WAIT_OBJECT_0 ? 0 : 1;
+}
+
+int 
+avlan_adapter_write(struct avlan_adapter *adapter, const uint8_t *buffer, uint32_t length)
+{
+    BYTE *packet = WintunAllocateSendPacket(adapter->wintun_session, (DWORD)length);
+    if (!packet)
+    {
+        return 1;
+    }
+
+    memcpy(packet, buffer, length);
+    WintunSendPacket(adapter->wintun_session, packet);
+    return 0;
+}
+
+void 
+avlan_close_adapter(struct avlan_adapter *adapter) {
+    if (!adapter)
+    {
+        return;
+    }
+
+    WintunEndSession(adapter->wintun_session);
+    WintunCloseAdapter(adapter->wintun_adapter);
+
+    free(adapter);
 }
