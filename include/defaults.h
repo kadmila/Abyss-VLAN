@@ -11,4 +11,9 @@
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #endif // MIN
 
+// performance tuning parameters
+// IOCP / io_uring
+#define NUM_RECVS 256
+#define RING_BUFFER_SIZE 1500 * NUM_RECVS
+
 #endif // DEFAULTS_H

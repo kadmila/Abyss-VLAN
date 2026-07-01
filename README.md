@@ -6,6 +6,8 @@
 * clang (llvm-gcc) version 22.1.8
 * cmake version 4.3.4
 
+* Keep line width under 80
+
 ### Windows
 
 * windows SDK

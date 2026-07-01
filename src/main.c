@@ -14,12 +14,12 @@ int main(int argc, char *argv[])
     printf("cidr: %s\n", args.cidr);
     printf("config: %s\n", args.config_file);
 
-    if (avlan_init() != 0) 
+    if (platform_init() != 0) 
     {
         return 1;
     }
 
-    struct avlan_adapter *adapter = avlan_create_adapter("Abyss VLAN", args.cidr);
+    struct platform_virtual_adapter *adapter = platform_create_adapter("Abyss VLAN", args.cidr);
     if (adapter == NULL) {
         fprintf_s(stderr, "Failed to create adapter\n");
         goto fail;
@@ -27,10 +27,10 @@ int main(int argc, char *argv[])
 
     uint8_t packet_buffer[MAX_PACKET_SIZE];
     uint32_t bytes_received;
-    while(avlan_adapter_poll(adapter, (uint8_t *)packet_buffer, sizeof(packet_buffer), &bytes_received) == 0) {
+    while(platform_adapter_poll(adapter, (uint8_t *)packet_buffer, sizeof(packet_buffer), &bytes_received) == 0) {
         if (bytes_received == 0)
         {
-            avlan_adapter_wait(adapter, -1);
+            platform_adapter_wait(adapter, -1);
             continue;
         }
 
@@ -44,12 +44,12 @@ int main(int argc, char *argv[])
         }
     }
     
-    avlan_close_adapter(adapter);
+    platform_close_adapter(adapter);
 
-    avlan_cleanup();
+    platform_cleanup();
     return 0;
 
 fail:
-    avlan_cleanup();
+    platform_cleanup();
     return 1;
 }
